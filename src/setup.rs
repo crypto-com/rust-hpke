@@ -18,7 +18,7 @@ pub(crate) type ExporterSecret<K> =
 
 /// get receiver context with shared secretly directly provided
 /// WARNING: temporary measure
-pub fn derive_receiver_ctx<A, Kdf, Kem, O>(
+pub fn derive_receiver_ctx<A, Kdf, Kem>(
     mode: &OpModeR<Kem::Kex>,
     shared_secret: SharedSecret<Kem>,
     info: &[u8],
