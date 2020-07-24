@@ -243,6 +243,41 @@ where
     encap_with_eph::<Kem>(pk_recip, sender_id_keypair, sk_eph)
 }
 
+/// unauth decap with shared secret provided externally
+/// WARNING: temporary measure
+pub fn decap_external<Kem: KemTrait>(
+    kex_res_eph_marshalled: &[u8],
+    pk_recip: &KemPubkey<Kem>,
+    encapped_key: &EncappedKey<Kem::Kex>,
+) -> Result<SharedSecret<Kem>, HpkeError> {
+    // Put together the binding context used for all KDF operations
+    let suite_id = kem_suite_id::<Kem>();
+
+    // kem_context = encapped_key || pk_recip || pk_sender_id
+    // We concat without allocation by making a buffer of the maximum possible size, then
+    // taking the appropriately sized slice.
+    let (kem_context_buf, kem_context_size) = concat_with_known_maxlen!(
+        MAX_PUBKEY_SIZE,
+        &encapped_key.marshal(),
+        &pk_recip.marshal()
+    );
+    let kem_context = &kem_context_buf[..kem_context_size];
+
+    // The "unauthed shared secret" is derived from just the KEX of the ephemeral input with the
+    // recipient pubkey. The HKDF-Expand call only errors if the output values are 255x the
+    // digest size of the hash function. Since these values are fixed at compile time, we don't
+    // worry about it.
+    let mut shared_secret = <SharedSecret<Kem> as Default>::default();
+    extract_and_expand::<Kem>(
+        &kex_res_eph_marshalled,
+        &suite_id,
+        &kem_context,
+        &mut shared_secret,
+    )
+    .expect("shared secret is way too big");
+    Ok(shared_secret)
+}
+
 // def Decap(enc, skR):
 //   pkE = Unmarshal(enc)
 //   dh = DH(skR, pkE)

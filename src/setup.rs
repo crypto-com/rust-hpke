@@ -16,6 +16,22 @@ use rand::{CryptoRng, RngCore};
 pub(crate) type ExporterSecret<K> =
     GenericArray<u8, <<K as KdfTrait>::HashImpl as Digest>::OutputSize>;
 
+/// get receiver context with shared secretly directly provided
+/// WARNING: temporary measure
+pub fn derive_receiver_ctx<A, Kdf, Kem, O>(
+    mode: &OpModeR<Kem::Kex>,
+    shared_secret: SharedSecret<Kem>,
+    info: &[u8],
+) -> AeadCtxR<A, Kdf, Kem>
+where
+    A: Aead,
+    Kdf: KdfTrait,
+    Kem: KemTrait,
+{
+    let enc_ctx = derive_enc_ctx::<_, _, Kem, _>(mode, shared_secret, info);
+    enc_ctx.into()
+}
+
 // This is the KeySchedule function defined in draft02 §6.1. It runs a KDF over all the parameters,
 // inputs, and secrets, and spits out a key-nonce pair to be used for symmetric encryption
 fn derive_enc_ctx<A, Kdf, Kem, O>(
