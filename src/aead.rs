@@ -1,7 +1,7 @@
 use crate::{
     kdf::{Kdf as KdfTrait, LabeledExpand},
     kem::Kem as KemTrait,
-    kex::{Marshallable, Unmarshallable},
+    kex::{Deserializable, Serializable},
     setup::ExporterSecret,
     util::{full_suite_id, FullSuiteId},
     HpkeError,
@@ -10,6 +10,7 @@ use crate::{
 use core::{marker::PhantomData, u8};
 
 use aead::{AeadInPlace as BaseAead, NewAead as BaseNewAead};
+use byteorder::{BigEndian, ByteOrder};
 use digest::generic_array::GenericArray;
 use hkdf::Hkdf;
 
@@ -52,83 +53,70 @@ impl Aead for ChaCha20Poly1305 {
     const AEAD_ID: u16 = 0x0003;
 }
 
-/// Treats the given seq (which is a bytestring) as a big-endian integer, and increments it
-///
-/// Return Value
-/// ============
-/// Returns Ok(()) if successful. Returns Err(()) if an overflow occured.
-fn increment_seq<A: Aead>(arr: &mut Seq<A>) -> Result<(), ()> {
-    let arr = arr.0.as_mut_slice();
-    for byte in arr.iter_mut().rev() {
-        if *byte < u8::MAX {
-            // If the byte is below the max, increment it
-            *byte += 1;
-            return Ok(());
-        } else {
-            // Otherwise, it's at the max, and we'll have to increment a more significant byte. In
-            // that case, clear this byte.
-            *byte = 0;
-        }
-    }
-
-    // If we got to the end and never incremented a byte, this array was maxed out
-    Err(())
-}
-
-// From draft02 §6.6
-//     def Context.Nonce(seq):
-//       encSeq = encode_big_endian(seq, len(self.nonce))
-//       return xor(self.nonce, encSeq)
-/// Derives a nonce from the given nonce and a "sequence number". The sequence number is treated as
-/// a big-endian integer with length equal to the nonce length.
-fn mix_nonce<A: Aead>(base_nonce: &AeadNonce<A>, seq: &Seq<A>) -> AeadNonce<A> {
-    // `seq` is already a byte string in big-endian order, so no conversion is necessary.
-
-    // XOR the base nonce bytes with the sequence bytes
-    let new_nonce_iter = base_nonce
-        .iter()
-        .zip(seq.0.iter())
-        .map(|(nonce_byte, seq_byte)| nonce_byte ^ seq_byte);
-
-    // This cannot fail, as the length of Nonce<A> is precisely the length of Seq<A>
-    GenericArray::from_exact_iter(new_nonce_iter).unwrap()
-}
-
 // A nonce is the same thing as a sequence counter. But you never increment a nonce.
 pub(crate) type AeadNonce<A> = GenericArray<u8, <<A as Aead>::AeadImpl as BaseAead>::NonceSize>;
 pub(crate) type AeadKey<A> = GenericArray<u8, <<A as Aead>::AeadImpl as aead::NewAead>::KeySize>;
 
-/// A sequence counter
-struct Seq<A: Aead>(AeadNonce<A>);
+/// A sequence counter. This is set to `u64` instead of the true nonce size of an AEAD for two
+/// reasons:
+///
+/// 1. No algorithm that would appear in HPKE would support nonce sizes less than `u64`.
+/// 2. It is just about physically impossible to encrypt 2^64 messages in sequence. If a computer
+///    computes 1 encryption every nanosecond, it would take over 584 years to run out of nonces.
+///    Notably, unlike randomized nonces, counting in sequence doesn't parallelize, so we don't
+///    have to imagine amortizing this computation across multiple computers. In conclusion, 64
+///    bits should be enough for anybody.
+#[derive(Default, Clone)]
+struct Seq(u64);
 
-/// The default sequence counter is all zeros
-impl<A: Aead> Default for Seq<A> {
-    fn default() -> Seq<A> {
-        Seq(<AeadNonce<A> as Default>::default())
-    }
+// def Context.IncrementSeq():
+//   if self.seq >= (1 << (8*Nn)) - 1:
+//     raise NonceOverflowError
+//   self.seq += 1
+/// Increments the sequence counter. Returns None on overflow.
+fn increment_seq(seq: &Seq) -> Option<Seq> {
+    // Try to add 1
+    seq.0.checked_add(1).map(Seq)
 }
 
-// Necessary for test_overflow
-#[cfg(test)]
-impl<A: Aead> Clone for Seq<A> {
-    fn clone(&self) -> Seq<A> {
-        Seq(self.0.clone())
-    }
+// def Context.ComputeNonce(seq):
+//   seq_bytes = I2OSP(seq, Nn)
+//   return xor(self.nonce, seq_bytes)
+/// Derives a nonce from the given nonce and a "sequence number". The sequence number is treated as
+/// a big-endian integer with length equal to the nonce length.
+fn mix_nonce<A: Aead>(base_nonce: &AeadNonce<A>, seq: &Seq) -> AeadNonce<A> {
+    // Write `seq` in big-endian order into a byte buffer that's the size of a nonce
+    let mut seq_buf = AeadNonce::<A>::default();
+    // We just write to the last seq_size bytes. This is necessary because our AEAD nonces (>= 96
+    // bits) are always bigger than the sequence buffer (64 bits). We write to the last 64 bits
+    // because this is a big-endian number.
+    let seq_size = core::mem::size_of::<Seq>();
+    let nonce_size = base_nonce.len();
+    BigEndian::write_u64(&mut seq_buf[nonce_size - seq_size..], seq.0);
+
+    // XOR the base nonce bytes with the sequence bytes
+    let new_nonce_iter = base_nonce
+        .iter()
+        .zip(seq_buf.iter())
+        .map(|(nonce_byte, seq_byte)| nonce_byte ^ seq_byte);
+
+    // This cannot fail, as the length of Nonce<A> is precisely the length of Seq
+    GenericArray::from_exact_iter(new_nonce_iter).unwrap()
 }
 
 /// An authenticated encryption tag
 pub struct AeadTag<A: Aead>(GenericArray<u8, <A::AeadImpl as BaseAead>::TagSize>);
 
-impl<A: Aead> Marshallable for AeadTag<A> {
+impl<A: Aead> Serializable for AeadTag<A> {
     type OutputSize = <A::AeadImpl as BaseAead>::TagSize;
 
-    fn marshal(&self) -> GenericArray<u8, Self::OutputSize> {
+    fn to_bytes(&self) -> GenericArray<u8, Self::OutputSize> {
         self.0.clone()
     }
 }
 
-impl<A: Aead> Unmarshallable for AeadTag<A> {
-    fn unmarshal(encoded: &[u8]) -> Result<Self, HpkeError> {
+impl<A: Aead> Deserializable for AeadTag<A> {
+    fn from_bytes(encoded: &[u8]) -> Result<Self, HpkeError> {
         if encoded.len() != Self::size() {
             Err(HpkeError::InvalidEncoding)
         } else {
@@ -151,7 +139,7 @@ pub(crate) struct AeadCtx<A: Aead, Kdf: KdfTrait, Kem: KemTrait> {
     /// The exporter secret, used in the `export()` method
     exporter_secret: ExporterSecret<Kdf>,
     /// The running sequence number
-    seq: Seq<A>,
+    seq: Seq,
     /// This binds the `AeadCtx` to the KEM that made it. Used to generate `suite_id`.
     src_kem: PhantomData<Kem>,
     /// The full ID of the ciphersuite that created this `AeadCtx`. Used for context binding.
@@ -187,7 +175,7 @@ impl<A: Aead, Kdf: KdfTrait, Kem: KemTrait> AeadCtx<A, Kdf, Kem> {
             encryptor: <A::AeadImpl as aead::NewAead>::new(key),
             nonce,
             exporter_secret,
-            seq: <Seq<A> as Default>::default(),
+            seq: <Seq as Default>::default(),
             src_kem: PhantomData,
             suite_id,
         }
@@ -231,9 +219,9 @@ impl<A: Aead, Kdf: KdfTrait, Kem: KemTrait> Clone for AeadCtxR<A, Kdf, Kem> {
 
 impl<A: Aead, Kdf: KdfTrait, Kem: KemTrait> AeadCtxR<A, Kdf, Kem> {
     // def Context.Open(aad, ct):
-    //   pt = Open(self.key, self.Nonce(self.seq), aad, ct)
+    //   pt = Open(self.key, self.ComputeNonce(self.seq), aad, ct)
     //   if pt == OpenError:
-    //     return OpenError
+    //     raise OpenError
     //   self.IncrementSeq()
     //   return pt
     /// Does a "detached open in place", meaning it overwrites `ciphertext` with the resulting
@@ -256,7 +244,7 @@ impl<A: Aead, Kdf: KdfTrait, Kem: KemTrait> AeadCtxR<A, Kdf, Kem> {
             Err(HpkeError::SeqOverflow)
         } else {
             // Compute the nonce and do the encryption in place
-            let nonce = mix_nonce(&self.0.nonce, &self.0.seq);
+            let nonce = mix_nonce::<A>(&self.0.nonce, &self.0.seq);
             let decrypt_res = self
                 .0
                 .encryptor
@@ -270,8 +258,9 @@ impl<A: Aead, Kdf: KdfTrait, Kem: KemTrait> AeadCtxR<A, Kdf, Kem> {
             // Opening was a success
             // Try to increment the sequence counter. If it fails, this was our last
             // decryption.
-            if increment_seq(&mut self.0.seq).is_err() {
-                self.0.overflowed = true;
+            match increment_seq(&self.0.seq) {
+                Some(new_seq) => self.0.seq = new_seq,
+                None => self.0.overflowed = true,
             }
 
             Ok(())
@@ -313,7 +302,7 @@ impl<A: Aead, Kdf: KdfTrait, Kem: KemTrait> Clone for AeadCtxS<A, Kdf, Kem> {
 
 impl<A: Aead, Kdf: KdfTrait, Kem: KemTrait> AeadCtxS<A, Kdf, Kem> {
     // def Context.Seal(aad, pt):
-    //   ct = Seal(self.key, self.Nonce(self.seq), aad, pt)
+    //   ct = Seal(self.key, self.ComputeNonce(self.seq), aad, pt)
     //   self.IncrementSeq()
     //   return ct
     /// Does a "detached seal in place", meaning it overwrites `plaintext` with the resulting
@@ -331,7 +320,7 @@ impl<A: Aead, Kdf: KdfTrait, Kem: KemTrait> AeadCtxS<A, Kdf, Kem> {
             Err(HpkeError::SeqOverflow)
         } else {
             // Compute the nonce and do the encryption in place
-            let nonce = mix_nonce(&self.0.nonce, &self.0.seq);
+            let nonce = mix_nonce::<A>(&self.0.nonce, &self.0.seq);
             let tag_res = self
                 .0
                 .encryptor
@@ -344,8 +333,9 @@ impl<A: Aead, Kdf: KdfTrait, Kem: KemTrait> AeadCtxS<A, Kdf, Kem> {
             };
 
             // Try to increment the sequence counter. If it fails, this was our last encryption.
-            if increment_seq(&mut self.0.seq).is_err() {
-                self.0.overflowed = true;
+            match increment_seq(&self.0.seq) {
+                Some(new_seq) => self.0.seq = new_seq,
+                None => self.0.overflowed = true,
             }
 
             // Return the tag
@@ -353,6 +343,8 @@ impl<A: Aead, Kdf: KdfTrait, Kem: KemTrait> AeadCtxS<A, Kdf, Kem> {
         }
     }
 
+    // def Context.Export(exporter_context, L):
+    //   return LabeledExpand(self.exporter_secret, "sec", exporter_context, L)
     /// Fills a given buffer with secret bytes derived from this encryption context. This value
     /// does not depend on sequence number, so it is constant for the lifetime of this context.
     ///
@@ -369,9 +361,7 @@ impl<A: Aead, Kdf: KdfTrait, Kem: KemTrait> AeadCtxS<A, Kdf, Kem> {
 #[cfg(test)]
 mod test {
     use super::{AeadTag, AesGcm128, AesGcm256, ChaCha20Poly1305, Seq};
-    use crate::{kdf::HkdfSha256, kex::Unmarshallable, test_util::gen_ctx_simple_pair, HpkeError};
-
-    use core::u8;
+    use crate::{kdf::HkdfSha256, kex::Deserializable, test_util::gen_ctx_simple_pair, HpkeError};
 
     /// Tests that encryption context secret export does not change behavior based on the
     /// underlying sequence number This logic is cipher-agnostic, so we don't make the test generic
@@ -425,12 +415,9 @@ mod test {
 
                 // Make a sequence number that's at the max
                 let big_seq = {
-                    let mut buf = <Seq<A> as Default>::default();
-                    // Set all the values to the max
-                    for byte in buf.0.iter_mut() {
-                        *byte = u8::MAX;
-                    }
-                    buf
+                    let mut seq = <Seq as Default>::default();
+                    seq.0 = u64::MAX;
+                    seq
                 };
 
                 let (mut sender_ctx, mut receiver_ctx) = gen_ctx_simple_pair::<A, Kdf, Kem>();
@@ -477,7 +464,7 @@ mod test {
                     // Now try to decrypt something. This isn't a valid ciphertext or tag, but the
                     // overflow should fail before the tag check fails.
                     let mut dummy_ciphertext = [0u8; 32];
-                    let dummy_tag = AeadTag::unmarshal(&[0; 16]).unwrap();
+                    let dummy_tag = AeadTag::from_bytes(&[0; 16]).unwrap();
 
                     match receiver_ctx.open(&mut dummy_ciphertext[..], aad, &dummy_tag) {
                         Err(HpkeError::SeqOverflow) => {} // Good, this should have overflowed

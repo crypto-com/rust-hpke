@@ -1,22 +1,26 @@
-//! This file describes a simple interaction between a client and a server. Here's the flow:
-//!  1. The server initializes itself with a new public-private keypair.
-//!  2. The client encapsulates a symmetric key, and then uses it to encrypt a message. It then
-//!     sends the server the encapsulated key and the authenticated ciphertext.
-//!  3. The server derives the encryption context from the encapsulated key and uses it to decrypt
-//!     the ciphertext.
-//!
-//! Concepts not covered in this example:
-//!  * Different operation modes (Auth, Psk, AuthPsk). See the docs on `OpModeR` and `OpModeS`
-//!    types for more info
-//!  * The single-shot API. See the methods exposed in the `single_shot` module for more info. The
-//!    single-shot methods are basically just `setup` followed by `seal/open`.
-//!  * Proper error handling. Everything here just panics when an error is encountered. It is up to
-//!    the user of this library to do the appropriate thing when a function returns an error.
+// This file describes a simple interaction between a client and a server. Here's the flow:
+//  1. The server initializes itself with a new public-private keypair.
+//  2. The client generates and encapsulates a symmetric key, and uses that key to derive an
+//     encryption context. With the encryption context, it encrypts ("seals") a message and gets an
+//     authenticated ciphertext. It then sends the server the encapsulated key and the
+//     authenticated ciphertext.
+//  3. The server uses the received encapsulated key to derive the decryption context, and decrypts
+//     the ciphertext.
+//
+// Concepts not covered in this example:
+//  * Different operation modes (Auth, Psk, AuthPsk). See the docs on `OpModeR` and `OpModeS`
+//    types for more info
+//  * The single-shot API. See the methods exposed in the `single_shot` module for more info. The
+//    single-shot methods are basically just `setup` followed by `seal/open`.
+//  * Proper error handling. Everything here just panics when an error is encountered. It is up to
+//    the user of this library to do the appropriate thing when a function returns an error.
 
 use hpke::{
     aead::{AeadTag, ChaCha20Poly1305},
     kdf::HkdfSha384,
-    EncappedKey, Kem as KemTrait, KeyExchange, Marshallable, OpModeR, OpModeS, Unmarshallable,
+    kem::X25519HkdfSha256,
+    kex::KeyExchange,
+    Deserializable, EncappedKey, Kem as KemTrait, OpModeR, OpModeS, Serializable,
 };
 
 use rand::{rngs::StdRng, SeedableRng};
@@ -24,14 +28,14 @@ use rand::{rngs::StdRng, SeedableRng};
 const INFO_STR: &'static [u8] = b"example session";
 
 // These are the only algorithms we're gonna use for this example
-type Kem = hpke::kem::X25519HkdfSha256;
+type Kem = X25519HkdfSha256;
 type Aead = ChaCha20Poly1305;
 type Kdf = HkdfSha384;
 
 // The KEX is dependent on the choice of KEM
 type Kex = <Kem as KemTrait>::Kex;
 
-// Initialize the server with a fresh keypair
+// Initializes the server with a fresh keypair
 fn server_init() -> (
     <Kex as KeyExchange>::PrivateKey,
     <Kex as KeyExchange>::PublicKey,
@@ -75,12 +79,12 @@ fn server_decrypt_msg(
     associated_data: &[u8],
     tag_bytes: &[u8],
 ) -> Vec<u8> {
-    // We have to unmarshal the secret key, AEAD tag, and encapsulated pubkey. These fail if the
+    // We have to derialize the secret key, AEAD tag, and encapsulated pubkey. These fail if the
     // bytestrings are the wrong length.
-    let server_sk = <Kex as KeyExchange>::PrivateKey::unmarshal(server_sk_bytes)
+    let server_sk = <Kex as KeyExchange>::PrivateKey::from_bytes(server_sk_bytes)
         .expect("could not deserialize server privkey!");
-    let tag = AeadTag::<Aead>::unmarshal(tag_bytes).expect("could not deserialize AEAD tag!");
-    let encapped_key = EncappedKey::<Kex>::unmarshal(encapped_key_bytes)
+    let tag = AeadTag::<Aead>::from_bytes(tag_bytes).expect("could not deserialize AEAD tag!");
+    let encapped_key = EncappedKey::<Kex>::from_bytes(encapped_key_bytes)
         .expect("could not deserialize the encapsulated pubkey!");
 
     // Decapsulate and derive the shared secret. This creates a shared AEAD context.
@@ -113,13 +117,13 @@ fn main() {
     let (encapped_key, ciphertext, tag) = client_encrypt_msg(msg, associated_data, &server_pubkey);
 
     // Now imagine we send everything over the wire, so we have to serialize it
-    let encapped_key_bytes = encapped_key.marshal();
-    let tag_bytes = tag.marshal();
+    let encapped_key_bytes = encapped_key.to_bytes();
+    let tag_bytes = tag.to_bytes();
 
     // Now imagine the server had to reboot so it saved its private key in byte format
-    let server_privkey_bytes = server_privkey.marshal();
+    let server_privkey_bytes = server_privkey.to_bytes();
 
-    // Now let the server decrypt the message. The marshal() calls returned a GenericArray, so we
+    // Now let the server decrypt the message. The to_bytes() calls returned a GenericArray, so we
     // have to convert them to slices before sending them
     let decrypted_msg = server_decrypt_msg(
         server_privkey_bytes.as_slice(),
