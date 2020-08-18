@@ -256,8 +256,8 @@ pub fn decap_external<Kem: KemTrait>(
     // taking the appropriately sized slice.
     let (kem_context_buf, kem_context_size) = concat_with_known_maxlen!(
         MAX_PUBKEY_SIZE,
-        &encapped_key.marshal(),
-        &pk_recip.marshal()
+        &encapped_key.to_bytes(),
+        &pk_recip.to_bytes()
     );
     let kem_context = &kem_context_buf[..kem_context_size];
 
