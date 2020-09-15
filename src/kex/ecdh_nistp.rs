@@ -5,16 +5,17 @@ use crate::{
     HpkeError,
 };
 
-use digest::generic_array::GenericArray;
+use generic_array::{typenum, GenericArray};
 use p256::{
-    arithmetic::{AffinePoint, ProjectivePoint, Scalar},
-    elliptic_curve::weierstrass::{
-        curve::Curve,
-        point::{UncompressedCurvePoint, UncompressedPointSize},
+    elliptic_curve::{
+        weierstrass::{
+            point::{UncompressedPoint, UncompressedPointSize},
+            public_key::FromPublicKey,
+        },
+        Curve, FromBytes,
     },
-    NistP256,
+    AffinePoint, NistP256, ProjectivePoint, Scalar,
 };
-use subtle::ConstantTimeEq;
 
 /// An ECDH-P256 public key
 #[derive(Clone)]
@@ -22,7 +23,7 @@ pub struct PublicKey(AffinePoint);
 
 // The range invariant below is maintained so that sk_to_pk is a well-defined operation. If you
 // disagree with this decision, fight me.
-/// A ECDH-P256 private key. This is a scalar in the range `[1,p)`.
+/// An ECDH-P256 private key. This is a scalar in the range `[1,p)` where `p` is the group order.
 #[derive(Clone)]
 pub struct PrivateKey(Scalar);
 
@@ -33,10 +34,11 @@ pub struct KexResult(AffinePoint);
 impl Serializable for PublicKey {
     // A fancy way of saying "65 bytes"
     // §7.1: Npk of DHKEM(P-256, HKDF-SHA256) is 65
-    type OutputSize = UncompressedPointSize<<NistP256 as Curve>::ScalarSize>;
+    type OutputSize = UncompressedPointSize<NistP256>;
 
     fn to_bytes(&self) -> GenericArray<u8, Self::OutputSize> {
-        GenericArray::clone_from_slice(&self.0.to_uncompressed_pubkey().into_bytes())
+        // Uncompressed pubkey
+        GenericArray::clone_from_slice(&self.0.to_pubkey(false).as_bytes())
     }
 }
 
@@ -54,14 +56,14 @@ impl PublicKey {
         // but does not check that the point is on the curve.
         let uncompressed = {
             let byte_arr = GenericArray::clone_from_slice(encoded);
-            UncompressedCurvePoint::from_bytes(byte_arr)?
+            UncompressedPoint::from_bytes(byte_arr)?
         };
 
         // Convert to an affine point. This will fail if the point is not on the curve or if the
         // point is the point at infinity. Both of these are invalid DH pubkeys.
         let aff = {
             let pubkey = p256::PublicKey::from(uncompressed);
-            AffinePoint::from_pubkey(&pubkey)
+            AffinePoint::from_public_key(&pubkey)
         };
 
         if aff.is_some().into() {
@@ -83,10 +85,11 @@ impl Deserializable for PublicKey {
 impl Serializable for PrivateKey {
     // A fancy way of saying "32 bytes"
     // §7.1: Nsecret of DHKEM(P-256, HKDF-SHA256) is 32
-    type OutputSize = <NistP256 as Curve>::ScalarSize;
+    type OutputSize = <NistP256 as Curve>::ElementSize;
 
     fn to_bytes(&self) -> GenericArray<u8, Self::OutputSize> {
-        GenericArray::clone_from_slice(&self.0.to_bytes())
+        // Scalars already know how to convert to bytes
+        self.0.into()
     }
 }
 
@@ -97,36 +100,32 @@ impl Deserializable for PrivateKey {
             return Err(HpkeError::InvalidEncoding);
         }
 
-        // All private keys must be in the range [1,p). It suffices to check that the given array
-        // is not all zeros, since Scalar::from_bytes requires its input to be in reduced form
-        // anyways. This means that if arr ends up being np for some integer n, then it'll get
-        // rejected later.
-        if encoded.ct_eq(&[0u8; 32]).into() {
-            return Err(HpkeError::InvalidEncoding);
-        }
-
         // Copy the bytes into a fixed-size array
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(encoded);
+        let arr = GenericArray::<u8, Self::OutputSize>::clone_from_slice(encoded);
 
-        // This will fail iff the bytes don't represent a number in the range [0,p)
-        let scalar = Scalar::from_bytes(arr);
-        if scalar.is_none().into() {
+        // We do not allow private keys to be 0. This is so that we can avoid checking the output
+        // of the P256::kex() function (see docs there for more detail)
+        let scalar = Scalar::from_bytes_reduced(&arr);
+        if scalar.is_zero().into() {
             return Err(HpkeError::InvalidEncoding);
         }
 
-        Ok(PrivateKey(scalar.unwrap()))
+        Ok(PrivateKey(scalar))
     }
 }
 
 // DH results are serialized in the same way as public keys
 impl Serializable for KexResult {
-    // §4.1: Ndh equals Npk
-    type OutputSize = <PublicKey as Serializable>::OutputSize;
+    // §4.1: Ndh of DHKEM(P-256, HKDF-SHA256) is 32
+    type OutputSize = typenum::U32;
 
+    // §4.1: Representation of the KEX result is the serialization of the x-coordinate
     fn to_bytes(&self) -> GenericArray<u8, Self::OutputSize> {
-        // Rewrap and serialize
-        PublicKey(self.0).to_bytes()
+        // The tagged compressed representation is is 0x04 || x-coord. We strip the 0x04 and output
+        // the rest
+        let compressed_pubkey = self.0.to_pubkey(true);
+        let tagged_bytes = compressed_pubkey.as_bytes();
+        GenericArray::<u8, Self::OutputSize>::clone_from_slice(&tagged_bytes[1..])
     }
 }
 
@@ -144,7 +143,7 @@ impl KeyExchange for DhP256 {
     /// Converts an P256 private key to a public key
     #[doc(hidden)]
     fn sk_to_pk(sk: &PrivateKey) -> PublicKey {
-        let pk = p256::arithmetic::ProjectivePoint::generator() * &sk.0;
+        let pk = p256::ProjectivePoint::generator() * &sk.0;
         // It's safe to unwrap() here, because PrivateKeys are guaranteed to never be 0 (see the
         // from_bytes() implementation for details)
         PublicKey(pk.to_affine().unwrap())
@@ -159,9 +158,12 @@ impl KeyExchange for DhP256 {
         // Do the DH operation
         let dh_res_proj = pk_proj * &sk.0;
 
-        // We can unwrap here because we know pk is not the point at infinity (since this has no
-        // affine representation), and sk is not 0 mod p (due to the invariant we keep on
-        // PrivateKeys)
+        // We can unwrap here because we know
+        // 1. pk is not the point at infinity (since this has no affine representation)
+        // 2. sk is not 0 mod p (due to the invariant we keep on PrivateKeys)
+        // 3. Exponentiating a non-identity element of a prime-order group by something less than
+        //    the order yields a non-identity value
+        // Therefore, dh_res_proj cannot be the point at infinity
         Ok(KexResult(dh_res_proj.to_affine().unwrap()))
     }
 
@@ -192,7 +194,7 @@ impl KeyExchange for DhP256 {
         let (_, hkdf_ctx) = labeled_extract::<Kdf>(&[], suite_id, b"dkp_prk", ikm);
 
         // The buffer we hold the candidate scalar bytes in. This is the size of a private key.
-        let mut buf = [0u8; 32];
+        let mut buf = GenericArray::<u8, <PrivateKey as Serializable>::OutputSize>::default();
 
         // Try to generate a key 256 times. Practically, this will succeed and return early on the
         // first iteration.
@@ -203,11 +205,11 @@ impl KeyExchange for DhP256 {
                 .unwrap();
 
             // Try to convert to a scalar
-            let sk = Scalar::from_bytes(buf);
+            let sk_scalar = Scalar::from_bytes(&buf);
 
             // If the conversion succeeded, return the keypair
-            if sk.is_some().into() {
-                let sk = PrivateKey(sk.unwrap());
+            if sk_scalar.is_some().into() {
+                let sk = PrivateKey(sk_scalar.unwrap());
                 let pk = Self::sk_to_pk(&sk);
                 return (sk, pk);
             }
@@ -234,7 +236,7 @@ mod tests {
     // We need this in our serialize-deserialize tests
     impl PartialEq for PrivateKey {
         fn eq(&self, other: &PrivateKey) -> bool {
-            self.0.to_bytes() == other.0.to_bytes()
+            self.to_bytes() == other.to_bytes()
         }
     }
 
@@ -267,11 +269,9 @@ mod tests {
             "56FBF3CA366CC23E8157854C13C58D6AAC23F046ADA30F8353E74F33039872AB", // y-coordinate
         ))
         .unwrap();
-        let dh_res_bytes = hex::decode(concat!(
-            "04",                                                               // Uncompressed
+        let dh_res_xcoord_bytes = hex::decode(
             "D6840F6B42F6EDAFD13116E0E12565202FEF8E9ECE7DCE03812464D04B9442DE", // x-coordinate
-            "522BDE0AF0D8585B8DEF9C183B5AE38F50235206A8674ECB5D98EDB20EB153A2", // y-coordinate
-        ))
+        )
         .unwrap();
 
         // Deserialize the pubkey and privkey and do a DH operation
@@ -279,8 +279,12 @@ mod tests {
         let pk_sender = <Kex as KeyExchange>::PublicKey::from_bytes(&pk_sender_bytes).unwrap();
         let derived_dh = <Kex as KeyExchange>::kex(&sk_recip, &pk_sender).unwrap();
 
-        // Assert that the derived DH result matches the test vector
-        assert_eq!(derived_dh.to_bytes().as_slice(), dh_res_bytes.as_slice());
+        // Assert that the derived DH result matches the test vector. Recall that the HPKE DH
+        // result is just the x-coordinate, so that's all we can compare
+        assert_eq!(
+            derived_dh.to_bytes().as_slice(),
+            dh_res_xcoord_bytes.as_slice()
+        );
     }
 
     // Test vector comes from §8.1 of RFC5903
