@@ -132,6 +132,13 @@ impl Serializable for KexResult {
     }
 }
 
+impl KexResult {
+    // return the compressed public key tag
+    pub fn tag(&self) -> u8 {
+        self.0.to_pubkey(true).as_bytes()[0]
+    }
+}
+
 /// Represents ECDH functionality over NIST curve P-256
 pub struct DhP256 {}
 
