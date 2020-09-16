@@ -1,6 +1,6 @@
 use crate::{
     kdf::{labeled_extract, Kdf as KdfTrait, LabeledExpand},
-    kex::{Deserializable, KeyExchange, Serializable},
+    kex::{Deserializable, KeyExchange, Serializable, ToPubkeyBytes},
     util::KemSuiteId,
     HpkeError,
 };
@@ -132,10 +132,11 @@ impl Serializable for KexResult {
     }
 }
 
-impl KexResult {
-    // return the compressed public key tag
-    pub fn tag(&self) -> u8 {
-        self.0.to_pubkey(true).as_bytes()[0]
+impl ToPubkeyBytes for KexResult {
+    type OutputSize = typenum::U33;
+
+    fn to_pubkey_bytes(&self) -> GenericArray<u8, typenum::U33> {
+        GenericArray::<u8, Self::OutputSize>::clone_from_slice(&self.0.to_pubkey(true).as_bytes())
     }
 }
 

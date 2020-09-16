@@ -1,6 +1,6 @@
 use crate::{
     kdf::{labeled_extract, Kdf as KdfTrait, LabeledExpand},
-    kex::{Deserializable, KeyExchange, Serializable},
+    kex::{Deserializable, KeyExchange, Serializable, ToPubkeyBytes},
     util::KemSuiteId,
     HpkeError,
 };
@@ -77,6 +77,14 @@ impl Serializable for KexResult {
     // X25519 represents things anyway, so we don't have to do anything special.
     fn to_bytes(&self) -> GenericArray<u8, typenum::U32> {
         // Dalek lets us convert shared secrets to to [u8; 32]
+        GenericArray::clone_from_slice(self.0.as_bytes())
+    }
+}
+
+impl ToPubkeyBytes for KexResult {
+    type OutputSize = typenum::U32;
+
+    fn to_pubkey_bytes(&self) -> GenericArray<u8, typenum::U32> {
         GenericArray::clone_from_slice(self.0.as_bytes())
     }
 }

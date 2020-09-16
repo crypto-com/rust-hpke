@@ -25,6 +25,18 @@ pub trait Deserializable: Serializable + Sized {
     fn from_bytes(encoded: &[u8]) -> Result<Self, HpkeError>;
 }
 
+/// for converting kex result
+pub trait ToPubkeyBytes {
+    type OutputSize: ArrayLength<u8>;
+
+    fn to_pubkey_bytes(&self) -> GenericArray<u8, Self::OutputSize>;
+
+    /// Returns the size (in bytes) of this type when serialized
+    fn size() -> usize {
+        Self::OutputSize::to_usize()
+    }
+}
+
 /// This trait captures the requirements of a key exchange mechanism. It must have a way to
 /// generate keypairs, perform the KEX computation, and serialize/deserialize KEX pubkeys. Most of
 /// this functionality is hidden, though. Use `Kem::derive_keypair` or `Kem::gen_keypair` to make
@@ -60,7 +72,7 @@ pub trait KeyExchange {
     type PrivateKey: Clone + Serializable + Deserializable;
 
     #[doc(hidden)]
-    type KexResult: Serializable;
+    type KexResult: Serializable + ToPubkeyBytes;
 
     #[doc(hidden)]
     fn sk_to_pk(sk: &Self::PrivateKey) -> Self::PublicKey;
